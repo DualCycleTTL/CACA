@@ -5,11 +5,12 @@ Terminal Teluk Lamong - Pelindo
 Berisi algoritma komputasi multi-layer:
 1. Rekonstruksi & Normalisasi Data (VBA Val(), datetime fallback, vessel cleaner)
 2. Layer 1: Deteksi Combo 20ft (Sliding Window Greedy Matching)
-3. Layer 1b: Deteksi Twin Lift (Sama Kapal & Delta Waktu DISC_LOAD_TS)
+3. Layer 1b: Deteksi Twin Lift (Sama Kapal, Delta Waktu DISC_LOAD_TS, & Eligibilitas CHE/Crane)
 4. Pembentukan Event Ritase Truk
 5. Layer 2: Deteksi Dual Cycle (Lintas Aktivitas LOAD vs DISC)
 6. Penomoran Urut Event ID Global
-7. Perhitungan Ringkasan Metrik & Evaluasi KPI Bulanan
+7. Perhitungan Ringkasan Metrik (basis 20ft utk Combo/Single/Twinlift) & Evaluasi KPI Bulanan
+8. Utilitas Hari & Shift (untuk visualisasi produktivitas, pengganti heatmap)
 """
 
 import re
@@ -24,8 +25,20 @@ AMBANG_COMBO_MENIT_DEFAULT = 40
 AMBANG_DUAL_MENIT_DEFAULT = 240  # 4 jam
 AMBANG_TWINLIFT_MENIT_DEFAULT = 1  # 1 menit selisih DISC_LOAD_TS
 SIZE_ELIGIBLE = 20  # Ukuran kontainer eligible Combo/Twinlift (20ft)
+CHE_SUFFIX_DILARANG_TWINLIFT_DEFAULT = "D"  # Kode CHE/crane berakhiran ini TIDAK bisa Twinlift
 
 _VBA_VAL_RE = re.compile(r"^\s*[+-]?\d+(\.\d+)?")
+
+HARI_ID = {
+    "Monday": "Senin",
+    "Tuesday": "Selasa",
+    "Wednesday": "Rabu",
+    "Thursday": "Kamis",
+    "Friday": "Jumat",
+    "Saturday": "Sabtu",
+    "Sunday": "Minggu",
+}
+URUTAN_HARI_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
 
 
 def klasifikasi_activity(val: object) -> str:
@@ -57,6 +70,46 @@ def bersihkan_ves_id(series: pd.Series) -> pd.Series:
     s = s.map(lambda v: v.strip() if isinstance(v, str) else v)
     s = s.map(lambda v: pd.NA if isinstance(v, str) and v == "" else v)
     return s
+
+
+def che_dilarang_twinlift(che_id: object, suffix: str = CHE_SUFFIX_DILARANG_TWINLIFT_DEFAULT) -> bool:
+    """
+    Cek apakah kode CHE/crane berakhiran suffix tertentu (default 'D').
+    Crane dengan akhiran ini secara teknis TIDAK bisa melakukan operasi Twin Lift,
+    jadi harus dikecualikan dari status Twinlift meskipun syarat lain terpenuhi.
+    """
+    if pd.isna(che_id):
+        return False
+    s = str(che_id).strip().upper()
+    return s.endswith(str(suffix).strip().upper())
+
+
+def tentukan_shift(ts) -> str:
+    """
+    Klasifikasi jam operasional ke salah satu dari 3 shift standar terminal:
+    Shift 1 (00:00-08:00), Shift 2 (08:00-16:00), Shift 3 (16:00-24:00).
+    """
+    if pd.isna(ts):
+        return "-"
+    jam = ts.hour
+    if 0 <= jam < 8:
+        return "Shift 1 (00:00-08:00)"
+    elif 8 <= jam < 16:
+        return "Shift 2 (08:00-16:00)"
+    else:
+        return "Shift 3 (16:00-24:00)"
+
+
+def tambah_kolom_hari_shift(df: pd.DataFrame, kolom_ts: str = "START_TS") -> pd.DataFrame:
+    """
+    Menambahkan kolom HARI (nama hari Bahasa Indonesia) & SHIFT ke suatu
+    DataFrame (biasanya `events`) berdasarkan kolom timestamp tertentu.
+    Dipakai untuk visualisasi produktivitas per Hari & Shift.
+    """
+    out = df.copy()
+    out["HARI"] = out[kolom_ts].dt.day_name().map(HARI_ID)
+    out["SHIFT"] = out[kolom_ts].apply(tentukan_shift)
+    return out
 
 
 def siapkan_data(raw: pd.DataFrame, col_map: dict, size_eligible: int) -> pd.DataFrame:
@@ -166,12 +219,19 @@ def layer1_combo(df: pd.DataFrame, ambang_combo: float, size_eligible: int) -> p
     return out
 
 
-def deteksi_twinlift(df_combo: pd.DataFrame, ambang_twinlift: float, size_eligible: int):
+def deteksi_twinlift(
+    df_combo: pd.DataFrame,
+    ambang_twinlift: float,
+    size_eligible: int,
+    che_suffix_dilarang: str = CHE_SUFFIX_DILARANG_TWINLIFT_DEFAULT,
+):
     """
-    Layer 1b: Deteksi kondisi Twin Lift di dalam grup Combo:
-    1. Ukuran 20ft
+    Layer 1b: Deteksi kondisi Twin Lift di dalam grup Combo. Syarat:
+    1. Ukuran 20ft (kedua anggota)
     2. VES_ID sama
     3. Selisih DISC_LOAD_TS <= ambang_twinlift
+    4. Kode CHE/crane TIDAK berakhiran `che_suffix_dilarang` (default 'D') —
+       crane dengan akhiran ini secara teknis tidak bisa Twin Lift.
     """
     status_map = {}
     gap_map = {}
@@ -188,9 +248,13 @@ def deteksi_twinlift(df_combo: pd.DataFrame, ambang_twinlift: float, size_eligib
         syarat_kapal = r1["VES_ID"] == r2["VES_ID"]
         gap_disc_load = abs((r2["TS_G"] - r1["TS_G"]) / np.timedelta64(1, "m"))
         syarat_waktu = gap_disc_load <= ambang_twinlift
+        syarat_crane = not (
+            che_dilarang_twinlift(r1["CAR_CHE_ID"], che_suffix_dilarang)
+            or che_dilarang_twinlift(r2["CAR_CHE_ID"], che_suffix_dilarang)
+        )
 
         gap_map[gid] = round(float(gap_disc_load), 2)
-        if syarat_size and syarat_kapal and syarat_waktu:
+        if syarat_size and syarat_kapal and syarat_waktu and syarat_crane:
             status_map[gid] = "Twinlift"
         else:
             status_map[gid] = "Bukan Twinlift"
@@ -209,6 +273,7 @@ def bentuk_event(df: pd.DataFrame) -> pd.DataFrame:
             "GROUP_ID": df["GROUP_ID"].to_numpy(),
             "ACTIVITY": df["ACTIVITY"].to_numpy(),
             "CAR_CHE_ID": df["CAR_CHE_ID"].to_numpy(),
+            "CTR_SIZE": df["CTR_SIZE"].to_numpy(),
             "EVT_START": evt_start,
             "EVT_END": evt_end,
         }
@@ -217,6 +282,7 @@ def bentuk_event(df: pd.DataFrame) -> pd.DataFrame:
     events = tmp.groupby("GROUP_ID", sort=True).agg(
         ACTIVITY=("ACTIVITY", "first"),
         CAR_CHE_ID=("CAR_CHE_ID", "first"),
+        CTR_SIZE=("CTR_SIZE", "max"),  # utk grup Combo kedua anggota selalu size_eligible yg sama
         START_TS=("EVT_START", "min"),
         END_TS=("EVT_END", "max"),
         N_ANGGOTA=("GROUP_ID", "size"),
@@ -310,23 +376,38 @@ def gabungkan_hasil(df: pd.DataFrame, events: pd.DataFrame, event_id_map: dict) 
     return out
 
 
-def hitung_ringkasan(events: pd.DataFrame, out_df: pd.DataFrame) -> dict:
-    """Menghitung ringkasan statistik komprehensif, metrik KPI, dan agregasi bulanan."""
+def hitung_ringkasan(events: pd.DataFrame, out_df: pd.DataFrame, size_eligible: int = SIZE_ELIGIBLE) -> dict:
+    """
+    Menghitung ringkasan statistik komprehensif, metrik KPI, dan agregasi bulanan.
+
+    PENTING: Breakdown Combo/Single (tab Dual Cycle) dan Twinlift (tab Twinlift)
+    dihitung hanya dari "universe 20ft" — yaitu event Combo (yang selalu 20ft by
+    construction) ditambah event Single yang CTR_SIZE == size_eligible. Event
+    Single berukuran selain 20ft (mis. 40ft) dikeluarkan dari breakdown ini karena
+    Combo/Twinlift memang cuma berlaku utk 20ft.
+    """
     total_event = len(events)
     total_dual = int((events["STATUS"] == "Dual Cycle").sum())
     total_single = total_event - total_dual
 
-    combo_dual = int(((events["CONTAINER_STATUS"] == "Combo") & (events["STATUS"] == "Dual Cycle")).sum())
-    combo_single = int(((events["CONTAINER_STATUS"] == "Combo") & (events["STATUS"] == "Non Dual")).sum())
-    single_dual = int(((events["CONTAINER_STATUS"] == "Single") & (events["STATUS"] == "Dual Cycle")).sum())
-    single_single = int(((events["CONTAINER_STATUS"] == "Single") & (events["STATUS"] == "Non Dual")).sum())
+    # --- Universe 20ft ---
+    is_20ft = (events["CONTAINER_STATUS"] == "Combo") | (events["CTR_SIZE"] == size_eligible)
+    events_20ft = events[is_20ft]
+    total_20ft_event = int(is_20ft.sum())
 
-    total_combo = int((events["CONTAINER_STATUS"] == "Combo").sum())
+    combo_dual = int(((events_20ft["CONTAINER_STATUS"] == "Combo") & (events_20ft["STATUS"] == "Dual Cycle")).sum())
+    combo_single = int(((events_20ft["CONTAINER_STATUS"] == "Combo") & (events_20ft["STATUS"] == "Non Dual")).sum())
+    single_dual = int(((events_20ft["CONTAINER_STATUS"] == "Single") & (events_20ft["STATUS"] == "Dual Cycle")).sum())
+    single_single = int(((events_20ft["CONTAINER_STATUS"] == "Single") & (events_20ft["STATUS"] == "Non Dual")).sum())
+
+    total_combo = int((events["CONTAINER_STATUS"] == "Combo").sum())  # selalu 20ft
     total_twinlift = int((events["TWINLIFT_STATUS"] == "Twinlift").sum())
     total_combo_bukan_twinlift = total_combo - total_twinlift
-    total_non_twinlift = total_event - total_twinlift
-    pct_twinlift_of_total = (total_twinlift / total_event) if total_event else 0
-    pct_non_twinlift_of_total = (total_non_twinlift / total_event) if total_event else 0
+
+    # Basis Twinlift sekarang: universe 20ft (bukan total_event yg campur semua ukuran)
+    total_non_twinlift = total_20ft_event - total_twinlift
+    pct_twinlift_of_total = (total_twinlift / total_20ft_event) if total_20ft_event else 0
+    pct_non_twinlift_of_total = (total_non_twinlift / total_20ft_event) if total_20ft_event else 0
     pct_twinlift_of_combo = (total_twinlift / total_combo) if total_combo else 0
 
     dual_load = int(((out_df["STATUS"] == "Dual Cycle") & (out_df["ACTIVITY"] == "LOAD")).sum())
@@ -340,25 +421,28 @@ def hitung_ringkasan(events: pd.DataFrame, out_df: pd.DataFrame) -> dict:
 
     ev = events.copy()
     ev["BULAN"] = ev["START_TS"].dt.to_period("M")
+    ev["IS_20FT"] = is_20ft.to_numpy()
 
     monthly = ev.groupby("BULAN").agg(
         total_event=("STATUS", "count"),
+        total_20ft=("IS_20FT", "sum"),
         dual=("STATUS", lambda s: int((s == "Dual Cycle").sum())),
         combo=("CONTAINER_STATUS", lambda s: int((s == "Combo").sum())),
         twinlift=("TWINLIFT_STATUS", lambda s: int((s == "Twinlift").sum())),
     )
     monthly["non_dual"] = monthly["total_event"] - monthly["dual"]
-    monthly["single"] = monthly["total_event"] - monthly["combo"]
+    monthly["single_20ft"] = monthly["total_20ft"] - monthly["combo"]
     monthly["combo_bukan_twinlift"] = monthly["combo"] - monthly["twinlift"]
-    monthly["non_twinlift"] = monthly["total_event"] - monthly["twinlift"]
+    monthly["non_twinlift"] = monthly["total_20ft"] - monthly["twinlift"]
 
     monthly["pct_dual"] = np.where(monthly["total_event"] > 0, monthly["dual"] / monthly["total_event"], 0)
     monthly["pct_non_dual"] = np.where(monthly["total_event"] > 0, monthly["non_dual"] / monthly["total_event"], 0)
-    monthly["pct_combo"] = np.where(monthly["total_event"] > 0, monthly["combo"] / monthly["total_event"], 0)
-    monthly["pct_single"] = np.where(monthly["total_event"] > 0, monthly["single"] / monthly["total_event"], 0)
-    monthly["pct_twinlift"] = np.where(monthly["total_event"] > 0, monthly["twinlift"] / monthly["total_event"], 0)
+    # Combo/Single & Twinlift: basis 20ft
+    monthly["pct_combo"] = np.where(monthly["total_20ft"] > 0, monthly["combo"] / monthly["total_20ft"], 0)
+    monthly["pct_single"] = np.where(monthly["total_20ft"] > 0, monthly["single_20ft"] / monthly["total_20ft"], 0)
+    monthly["pct_twinlift"] = np.where(monthly["total_20ft"] > 0, monthly["twinlift"] / monthly["total_20ft"], 0)
     monthly["pct_non_twinlift"] = np.where(
-        monthly["total_event"] > 0, monthly["non_twinlift"] / monthly["total_event"], 0
+        monthly["total_20ft"] > 0, monthly["non_twinlift"] / monthly["total_20ft"], 0
     )
     monthly["pct_twinlift_of_combo"] = np.where(
         monthly["combo"] > 0, monthly["twinlift"] / monthly["combo"], 0
@@ -380,6 +464,7 @@ def hitung_ringkasan(events: pd.DataFrame, out_df: pd.DataFrame) -> dict:
         "single_dual": single_dual,
         "single_single": single_single,
         "total_combo": total_combo,
+        "total_20ft_event": total_20ft_event,
         "total_twinlift": total_twinlift,
         "total_combo_bukan_twinlift": total_combo_bukan_twinlift,
         "total_non_twinlift": total_non_twinlift,
@@ -406,7 +491,15 @@ def guess(options, keywords, default_idx=0):
     return default_idx
 
 
-def proses_analisis_lengkap(raw, col_map, size_eligible, ambang_combo, ambang_dual, ambang_twinlift):
+def proses_analisis_lengkap(
+    raw,
+    col_map,
+    size_eligible,
+    ambang_combo,
+    ambang_dual,
+    ambang_twinlift,
+    che_suffix_dilarang_twinlift: str = CHE_SUFFIX_DILARANG_TWINLIFT_DEFAULT,
+):
     """
     Fungsi orkestrasi pipeline kalkulasi lengkap dari raw DataFrame sampai summary.
     Mengembalikan (out_df, events, summary).
@@ -416,12 +509,15 @@ def proses_analisis_lengkap(raw, col_map, size_eligible, ambang_combo, ambang_du
         return None, None, None
 
     df_combo = layer1_combo(df, ambang_combo, size_eligible)
-    twinlift_status_map, twinlift_gap_map = deteksi_twinlift(df_combo, ambang_twinlift, size_eligible)
+    twinlift_status_map, twinlift_gap_map = deteksi_twinlift(
+        df_combo, ambang_twinlift, size_eligible, che_suffix_dilarang_twinlift
+    )
     events = bentuk_event(df_combo)
     events["TWINLIFT_STATUS"] = events["GROUP_ID"].map(twinlift_status_map)
     events["TWINLIFT_GAP_MENIT"] = events["GROUP_ID"].map(twinlift_gap_map)
     events = layer2_dual(events, ambang_dual)
     events, event_id_map = beri_event_id(events, df_combo)
     out_df = gabungkan_hasil(df_combo, events, event_id_map)
-    summary = hitung_ringkasan(events, out_df)
+    events = tambah_kolom_hari_shift(events, "START_TS")
+    summary = hitung_ringkasan(events, out_df, size_eligible)
     return out_df, events, summary
