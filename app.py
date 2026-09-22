@@ -23,11 +23,12 @@ from modules.calculations import (
     AMBANG_COMBO_MENIT_DEFAULT,
     AMBANG_DUAL_MENIT_DEFAULT,
     AMBANG_TWINLIFT_MENIT_DEFAULT,
+    CHE_SUFFIX_DILARANG_TWINLIFT_DEFAULT,
     SIZE_ELIGIBLE,
     guess,
     proses_analisis_lengkap,
 )
-from modules.charts import apply_glass_theme
+from modules.charts import apply_glass_theme, chart_hari_shift_bar
 from modules.data_loader import baca_file, build_excel_data_only
 from modules.ui import (
     find_asset_file,
@@ -188,7 +189,8 @@ with st.container(border=True):
             step=1,
             help=(
                 "Jarak waktu maksimum DISC_LOAD_TS antar 2 kontainer dalam 1 Combo 20ft, "
-                "yang berasal dari kapal (VES_ID) & truk yang sama, supaya dianggap 'Twinlift'."
+                "yang berasal dari kapal (VES_ID) & truk yang sama, supaya dianggap 'Twinlift'. "
+                f"Crane/CHE berakhiran '{CHE_SUFFIX_DILARANG_TWINLIFT_DEFAULT}' otomatis tidak eligible."
             ),
         )
         render_html(
@@ -210,7 +212,7 @@ with st.container(border=True):
     # Peringatan jika hasil analisis sebelumnya sudah usang
     if "hasil" in st.session_state:
         _cached_summary = st.session_state["hasil"].get("summary", {})
-        if "total_non_twinlift" not in _cached_summary:
+        if "total_20ft_event" not in _cached_summary:
             st.session_state.pop("hasil", None)
             st.warning(
                 "Hasil analisis sebelumnya sudah usang. "
@@ -309,9 +311,9 @@ with st.container(border=True):
 
     monthly = summary["monthly"].reset_index().rename(columns={"BULAN": "Bulan"})
 
-    # 4 Tab Hasil Analisis
-    tab_dual, tab_twinlift, tab_vessel, tab_download = st.tabs(
-        ["Dual Cycle", "Twinlift", "Per Vessel", "Download Hasil Analisis"]
+    # 5 Tab Hasil Analisis
+    tab_dual, tab_twinlift, tab_produktivitas, tab_vessel, tab_download = st.tabs(
+        ["Dual Cycle", "Twinlift", "Hari & Shift", "Per Vessel", "Download Hasil Analisis"]
     )
 
     # ----------------------------------------------------------------
@@ -378,13 +380,19 @@ with st.container(border=True):
                 y="Jumlah",
                 color="Status",
                 barmode="group",
-                title="Rincian Container x Status (Event)",
+                title="Rincian Container x Status — Basis 20ft (Event)",
                 color_discrete_map={"Dual Cycle": "#0284C7", "Non Dual": "#94A3B8"},
                 text="Jumlah",
             )
             fig_bar.update_traces(marker=dict(line=dict(color="#ffffff", width=1)))
             apply_glass_theme(fig_bar)
             st.plotly_chart(fig_bar, width="stretch")
+
+        render_html(
+            '<div style="font-size:0.75rem;color:#94a3b8;margin-top:-12px;">'
+            'Catatan: breakdown Combo vs Single di atas hanya menghitung kontainer 20ft '
+            '(kontainer ukuran lain seperti 40ft tidak relevan karena tidak pernah bisa Combo).</div>'
+        )
 
         if len(monthly) > 0:
             monthly_dual_pct = monthly.melt(
@@ -429,11 +437,11 @@ with st.container(border=True):
                 y="Persentase",
                 color="Kategori",
                 barmode="stack",
-                title="Breakdown Bulanan: Combo vs Single (%)",
+                title="Breakdown Bulanan: Combo vs Single — Basis 20ft (%)",
                 color_discrete_map={"Combo": "#0EA5E9", "Single": "#64748B"},
                 text_auto=".1f",
             )
-            fig_month_container.update_layout(yaxis=dict(title="% dari Total Event", range=[0, 100]))
+            fig_month_container.update_layout(yaxis=dict(title="% dari Total 20ft", range=[0, 100]))
             apply_glass_theme(fig_month_container)
             st.plotly_chart(fig_month_container, width="stretch")
 
@@ -443,20 +451,22 @@ with st.container(border=True):
     with tab_twinlift:
         render_template("tab_twinlift_info.html", ambang_twinlift=hasil["ambang_twinlift"])
 
-        t1, t2, t3, t4 = st.columns(4)
+        t1, t2, t3, t4, t5 = st.columns(5)
         with t1:
-            render_kpi_card("Total Event", f"{summary['total_event']:,}", subtext="Basis Perhitungan", variant="blue")
+            render_kpi_card("Total Container", f"{summary['container_total']:,}", subtext="Semua Ukuran", variant="slate")
         with t2:
-            render_kpi_card("Twinlift", f"{summary['total_twinlift']:,}", badge="Optimum", variant="emerald")
+            render_kpi_card("Total 20 Feet", f"{summary['total_20ft_event']:,}", subtext="Basis Perhitungan", variant="blue")
         with t3:
-            render_kpi_card("Bukan Twinlift", f"{summary['total_non_twinlift']:,}", badge="Reguler", variant="slate")
+            render_kpi_card("Twinlift", f"{summary['total_twinlift']:,}", badge="Optimum", variant="emerald")
         with t4:
+            render_kpi_card("Bukan Twinlift", f"{summary['total_non_twinlift']:,}", badge="Reguler", variant="slate")
+        with t5:
             pct_twin_val = summary["pct_twinlift_of_total"] * 100
-            render_kpi_card("% Twinlift", f"{pct_twin_val:.1f}%", badge="Rasio Event", variant="blue")
+            render_kpi_card("% Twinlift", f"{pct_twin_val:.1f}%", badge="dari Total 20ft", variant="blue")
 
         tc1, tc2 = st.columns(2)
         with tc1:
-            if summary["total_event"] > 0:
+            if summary["total_20ft_event"] > 0:
                 twin_df = pd.DataFrame(
                     {
                         "Status": ["Twinlift", "Bukan Twinlift"],
@@ -469,7 +479,7 @@ with st.container(border=True):
                     names="Status",
                     values="Jumlah",
                     hole=0.52,
-                    title="Twinlift vs Bukan Twinlift (dari Total Event)",
+                    title="Twinlift vs Bukan Twinlift (dari Total 20 Feet)",
                     color="Status",
                     color_discrete_map={"Twinlift": "#0284C7", "Bukan Twinlift": "#94A3B8"},
                 )
@@ -484,7 +494,7 @@ with st.container(border=True):
                 fig_twin_pie.update_layout(margin=dict(t=72, b=25, l=25, r=25))
                 st.plotly_chart(fig_twin_pie, width="stretch")
             else:
-                st.info("Tidak ada event pada data ini.")
+                st.info("Tidak ada event 20ft pada data ini.")
 
         with tc2:
             if len(monthly) > 0:
@@ -505,16 +515,26 @@ with st.container(border=True):
                     y="Persentase",
                     color="Kategori",
                     barmode="stack",
-                    title="Breakdown Bulanan: Twinlift vs Bukan Twinlift (% dari Total Event)",
+                    title="Breakdown Bulanan: Twinlift vs Bukan Twinlift (% dari Total 20ft)",
                     color_discrete_map={"Twinlift": "#0284C7", "Bukan Twinlift": "#94A3B8"},
                     text_auto=".1f",
                 )
-                fig_month_twin.update_layout(yaxis=dict(title="% dari Total Event", range=[0, 100]))
+                fig_month_twin.update_layout(yaxis=dict(title="% dari Total 20ft", range=[0, 100]))
                 apply_glass_theme(fig_month_twin)
                 st.plotly_chart(fig_month_twin, width="stretch")
 
     # ----------------------------------------------------------------
-    # TAB 3: ANALISIS PER VESSEL
+    # TAB 3: PRODUKTIVITAS PER HARI & SHIFT (pengganti heatmap)
+    # ----------------------------------------------------------------
+    with tab_produktivitas:
+        if "HARI" in events.columns and "SHIFT" in events.columns:
+            fig_hari_shift = chart_hari_shift_bar(events)
+            st.plotly_chart(fig_hari_shift, width="stretch")
+        else:
+            st.info("Kolom HARI/SHIFT belum tersedia pada hasil analisis ini.")
+
+    # ----------------------------------------------------------------
+    # TAB 4: ANALISIS PER VESSEL
     # ----------------------------------------------------------------
     with tab_vessel:
         render_template("tab_vessel_info.html")
@@ -620,7 +640,7 @@ with st.container(border=True):
             st.plotly_chart(fig_v3, width="stretch")
 
     # ----------------------------------------------------------------
-    # TAB 4: DOWNLOAD HASIL ANALISIS
+    # TAB 5: DOWNLOAD HASIL ANALISIS
     # ----------------------------------------------------------------
     with tab_download:
         st.dataframe(out_df.head(1000), use_container_width=True, height=400)
